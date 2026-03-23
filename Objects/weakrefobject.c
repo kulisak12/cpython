@@ -6,6 +6,7 @@
 #include "pycore_pyerrors.h"      // _PyErr_ChainExceptions1()
 #include "pycore_pystate.h"
 #include "pycore_weakref.h"       // _PyWeakref_GET_REF()
+#include "pycore_pyatomic_ft_wrappers.h"
 
 #ifdef Py_GIL_DISABLED
 /*
@@ -23,6 +24,13 @@
  * - The weakref's hash is protected using atomic operations.
  * - The other mutable is protected by a striped lock keyed on the referenced
  *   object's address.
+ * - There are fast paths that use atomic loads of wr_object and
+ *   the head-of-list pointer to avoid acquiring the lock.
+ *   Because of that, all stores to these fields need to be atomic,
+ *   even if they are performed while holding the lock.
+ *   Relaxed ordering suffices for wr_object because it can only ever change
+ *   from an object pointer to Py_None. The head-of-list pointer requires
+ *   release/acquire ordering because it can change from NULL to non-NULL.
  * - The striped lock must be locked using `_Py_LOCK_DONT_DETACH` in order to
  *   support atomic deletion from WeakValueDictionaries. As a result, we must
  *   be careful not to perform any operations that could suspend while the
@@ -50,6 +58,13 @@
  *
  * - The weakref's hash is protected using atomic operations.
  * - The other mutable state is protected by a global lock.
+ * - There are fast paths that use atomic loads of wr_object and
+ *   the head-of-list pointer to avoid acquiring the lock.
+ *   Because of that, all stores to these fields need to be atomic,
+ *   even if they are performed while holding the lock.
+ *   Relaxed ordering suffices for wr_object because it can only ever change
+ *   from an object pointer to Py_None. The head-of-list pointer requires
+ *   release/acquire ordering because it can change from NULL to non-NULL.
  * - The lock must be locked using `_Py_LOCK_DONT_DETACH` in order to
  *   support atomic deletion from WeakValueDictionaries. As a result, we must
  *   be careful not to perform any operations that could suspend while the
@@ -141,9 +156,9 @@ clear_weakref_lock_held(PyWeakReference *self, PyObject **callback)
             /* If 'self' is the end of the list (and thus self->wr_next ==
                NULL) then the weakref list itself (and thus the value of *list)
                will end up being set to NULL. */
-            _Py_atomic_store_ptr(list, self->wr_next);
+            _Py_atomic_store_ptr_release(list, self->wr_next);
         }
-        _Py_atomic_store_ptr(&self->wr_object, Py_None);
+        _Py_atomic_store_ptr_relaxed(&self->wr_object, Py_None);
         if (self->wr_prev != NULL) {
             self->wr_prev->wr_next = self->wr_next;
         }
@@ -246,7 +261,8 @@ weakref_vectorcall(PyObject *self, PyObject *const *args,
 static Py_hash_t
 weakref_hash(PyObject *op)
 {
-    // Immutable objects and free-threaded builds require atomic operations
+    // Immutable objects and free-threaded builds require atomic operations.
+    // Relaxed ordering suffices because hash doesn't signal any state changes.
     PyWeakReference *self = _PyWeakref_CAST(op);
     Py_hash_t hash = _Py_atomic_load_ssize_relaxed(&self->hash);
     if (hash != -1) {
@@ -371,7 +387,8 @@ insert_head(PyWeakReference *newref, PyWeakReference **list)
     newref->wr_next = next;
     if (next != NULL)
         next->wr_prev = newref;
-    *list = newref;
+    // See the comment at the start of this file for why we need atomic.
+    _Py_atomic_store_ptr_release(list, newref);
 }
 
 /* See if we can reuse either the basic ref or proxy in list instead of
@@ -478,7 +495,7 @@ _PyWeakref_OnObjectFreeze(PyObject *object)
         return;
     }
     PyWeakReference **list = GET_WEAKREFS_LISTPTR(object);
-    if (_Py_atomic_load_ptr(list) == NULL) {
+    if (_Py_atomic_load_ptr_acquire(list) == NULL) {
         // Fast path for the common case
         return;
     }
@@ -1120,7 +1137,7 @@ PyObject_ClearWeakRefs(PyObject *object)
     }
 
     list = GET_WEAKREFS_LISTPTR(object);
-    if (FT_ATOMIC_LOAD_PTR(*list) == NULL) {
+    if (FT_ATOMIC_LOAD_PTR_ACQUIRE(*list) == NULL) {
         // Fast path for the common case
         return;
     }
@@ -1205,7 +1222,7 @@ _PyImmutability_ClearWeakRefsWithCallback(PyObject *object, PyWeakReference **ca
     }
 
     PyWeakReference **list = GET_WEAKREFS_LISTPTR(object);
-    if (_Py_atomic_load_ptr(list) == NULL) {
+    if (_Py_atomic_load_ptr_acquire(list) == NULL) {
         // Fast path for the common case
         return;
     }

@@ -11,7 +11,6 @@ extern "C" {
 #include "pycore_critical_section.h" // Py_BEGIN_CRITICAL_SECTION()
 #include "pycore_lock.h"             // PyMutex_LockFlags()
 #include "pycore_object.h"           // _Py_REF_IS_MERGED()
-#include "pycore_pyatomic_ft_wrappers.h"
 
 #ifdef Py_GIL_DISABLED
 
@@ -111,14 +110,14 @@ static inline PyObject* _PyWeakref_GET_REF(PyObject *ref_obj)
     assert(PyWeakref_Check(ref_obj));
     PyWeakReference *ref = _Py_CAST(PyWeakReference*, ref_obj);
 
-    PyObject *obj = _Py_atomic_load_ptr(&ref->wr_object);
+    PyObject *obj = _Py_atomic_load_ptr_relaxed(&ref->wr_object);
     if (obj == Py_None) {
         // clear_weakref() was called
         return NULL;
     }
 
     LOCK_WEAKREFS(obj);
-    PyObject* result = get_ref_lock_held(ref, obj);
+    PyObject *result = get_ref_lock_held(ref, obj);
     UNLOCK_WEAKREFS(obj);
     return result;
 }
@@ -128,7 +127,8 @@ static inline int _PyWeakref_IS_DEAD(PyObject *ref_obj)
     assert(PyWeakref_Check(ref_obj));
     int ret = 0;
     PyWeakReference *ref = _Py_CAST(PyWeakReference*, ref_obj);
-    PyObject *obj = FT_ATOMIC_LOAD_PTR(ref->wr_object);
+
+    PyObject *obj = _Py_atomic_load_ptr_relaxed(&ref->wr_object);
     if (obj == Py_None) {
         // clear_weakref() was called
         ret = 1;
