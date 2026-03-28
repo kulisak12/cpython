@@ -309,6 +309,9 @@ struct FreezeState {
     PyObject *dfs;
     // Used to track SCC to handle cycles during traversal
     PyObject *pending;
+    // Used to track objects that we got to when following a weakref.
+    // Such objects should be frozen but not count the weakref into an SCC.
+    PyObject *weakref_targets;
 #endif
     // Used to track visited nodes that don't have inline GC state.
     // This is required to be able to backtrack a failed freeze.
@@ -446,6 +449,7 @@ static int init_freeze_state(struct FreezeState *state)
 #ifndef GIL_DISABLED
     state->dfs = PyList_New(0);
     state->pending = PyList_New(0);
+    state->weakref_targets = PyList_New(0);
 #endif
     state->visited = _Py_hashtable_new(
         _Py_hashtable_hash_ptr,
@@ -480,9 +484,13 @@ static void deallocate_FreezeState(struct FreezeState *state)
     while(PyList_Size(state->dfs) > 0){
         pop(state->dfs);
     }
+    while(PyList_Size(state->weakref_targets) > 0){
+        pop(state->weakref_targets);
+    }
 
     Py_DECREF(state->dfs);
     Py_DECREF(state->pending);
+    Py_DECREF(state->weakref_targets);
 #endif
 }
 
@@ -794,20 +802,6 @@ static void scc_add_internal_refcounts(PyObject* obj, struct SCCDetails* details
 
         get_reachable_proc(Py_TYPE(c))(c, (visitproc)scc_add_internal_refcount_visit, root);
 
-        if (PyWeakref_Check(c)) {
-            // We followed weakreferences during freeze, so need to here as well.
-            PyObject* wr = NULL;
-            PyWeakref_GetRef(c, &wr);
-            if (wr != NULL) {
-                // This will increment the reference if it is in the same SCC
-                // and do nothing otherwise.  We are treating the weakref as
-                // a strong reference for the immutable state.
-                scc_add_internal_refcount_visit(wr, root);
-                Py_DECREF(wr);
-            }
-            details->has_weakreferences++;
-        }
-
         if (Py_TYPE(c)->tp_del != NULL)
             details->has_legacy_finalizers++;
         if (Py_TYPE(c)->tp_finalize != NULL && !_PyGC_FINALIZED(c))
@@ -830,15 +824,6 @@ static void scc_make_mutable(PyObject* obj)
         PyObject* c = n;
         n = scc_next(c);
         _Py_CLEAR_IMMUTABLE(c);
-        if (PyWeakref_Check(c)) {
-            PyObject* wr = NULL;
-            PyWeakref_GetRef(c, &wr);
-            if (wr != NULL) {
-                // Turn back to weak reference. We made the weak references strong during freeze.
-                Py_DECREF(wr);
-                Py_DECREF(wr);
-            }
-        }
     } while (n != obj);
 }
 
@@ -1366,17 +1351,6 @@ static void rollback_completed_scc(PyObject* obj)
         PyObject* c = n;
         n = scc_next(c);
         get_reachable_proc(Py_TYPE(c))(c, (visitproc)rollback_refcount_visit, ring);
-
-        // Handle weak references the same way as scc_add_internal_refcounts
-        // TODO(Immutable): David and Fred this change will impact you weak reference work.
-        if (PyWeakref_Check(c)) {
-            PyObject* wr = NULL;
-            PyWeakref_GetRef(c, &wr);
-            if (wr != NULL) {
-                rollback_refcount_visit(wr, ring);
-                Py_DECREF(wr);
-            }
-        }
     } while (n != obj);
 
     _Py_hashtable_destroy(ring);
@@ -1448,6 +1422,27 @@ static int freeze_visit(PyObject* obj, void* freeze_state_untyped)
     TRACE_MERMAID_EDGE(freeze_state->start, obj);
 
     if(push(dfs, obj)){
+        PyErr_NoMemory();
+        return -1;
+    }
+
+    return 0;
+}
+
+static int freeze_visit_weakref(PyObject* obj, void* freeze_state_untyped)
+{
+    struct FreezeState* freeze_state = (struct FreezeState *)freeze_state_untyped;
+    assert(obj != NULL);
+
+    if (_Py_IsImmutable(obj) && !is_pending(obj, NULL)) {
+        return 0;
+    }
+
+    debug_obj("-wr-> %s (%p) rc=%zu\n", obj, Py_REFCNT(obj));
+
+    TRACE_MERMAID_EDGE(freeze_state->start, obj);
+
+    if(push(freeze_state->weakref_targets, obj)){
         PyErr_NoMemory();
         return -1;
     }
@@ -1910,21 +1905,6 @@ int _Py_DecRef_Immutable(PyObject *op)
     }
 
     _Py_CLEAR_IMMUTABLE(op);
-
-    if (PyWeakref_Check(op)) {
-        debug("Handling weak reference %p\n", op);
-        PyObject* wr;
-        int res = PyWeakref_GetRef(op, &wr);
-        if (res == 1) {
-            // Make the weak reference weak.
-            // Get ref increments the refcount, so we need to decref twice.
-            Py_DECREF(wr);
-            Py_DECREF(wr);
-        }
-        // TODO: Don't know how to handle failure here.  It should never happen,
-        // as the reference was made strong during freezing.
-    }
-
     return true;
 #endif
 }
@@ -2039,6 +2019,11 @@ static void undo_freeze(struct FreezeState* state) {
             continue;
         }
         unfreeze(item);
+    }
+
+    // Clear weakref targets
+    while(PyList_Size(state->weakref_targets) > 0){
+        pop(state->weakref_targets);
     }
 
     // Unfreeze completed SCCs via intrusive linked list.
@@ -2165,19 +2150,11 @@ static int traverse_freeze(PyObject* obj, struct FreezeState* freeze_state)
     // for immutability.  Otherwise, we could share mutable state
     // using a weak reference.
     if (PyWeakref_Check(obj)) {
-        // Make the weak reference strong.
-        // Get Ref increments the refcount.
-        //
-        // This could be done via a pre-freeze hook, but we only want to keep
-        // the strong reference if freezing succeeds. Having this as a special
-        // case makes this easier to handle.
-        PyObject* wr;
-        int res = PyWeakref_GetRef(obj, &wr);
-        if (res == -1) {
-            goto error;
-        }
-        if (res == 1) {
-            if (freeze_visit(wr, freeze_state)) {
+        PyObject* wr_target = _PyWeakref_GET_REF(obj);
+        if (wr_target != NULL) {
+            int res = freeze_visit_weakref(wr_target, freeze_state);
+            Py_DECREF(wr_target);
+            if (res) {
                 goto error;
             }
         }
@@ -2330,6 +2307,7 @@ freeze_impl(PyObject *const *objs, Py_ssize_t nobjs)
 restart:
         assert(PyList_Size(freeze_state.dfs) == 0);
         assert(PyList_Size(freeze_state.pending) == 0);
+        assert(PyList_Size(freeze_state.weakref_targets) == 0);
         for (Py_ssize_t i = 0; i < nobjs; i++) {
             if (_Py_IsImmutable(objs[i])) {
                 continue;
@@ -2339,8 +2317,10 @@ restart:
         freeze_state.restart = false;
     }
 
-    while (PyList_Size(freeze_state.dfs) != 0) {
-        PyObject* item = pop(freeze_state.dfs);
+    while (PyList_Size(freeze_state.dfs) != 0
+        || PyList_Size(freeze_state.weakref_targets) != 0) {
+        PyObject* item = (PyList_Size(freeze_state.dfs) != 0) ?
+            pop(freeze_state.dfs) : pop(freeze_state.weakref_targets);
 
         if (item == PostOrderMarker) {
             item = pop(freeze_state.dfs);

@@ -39,8 +39,7 @@ class TestRefcounts(unittest.TestCase):
         freeze(a)
         wr = weakref.ref(a)
         # The weakref should be frozen to ensure atomic refcounting.
-        # FIXME(Immutable): Freezing a weakref currently makes it strong.
-        # self.assertTrue(is_frozen(wr))
+        self.assertTrue(is_frozen(wr))
         self.assertEqual(sys.getrefcount(wr), sys.getrefcount(baseline))
 
     def test_weakref_to_frozen_object_callback(self):
@@ -58,8 +57,7 @@ class TestRefcounts(unittest.TestCase):
         wr = weakref.ref(a)
         freeze(a)
         # The weakref should be frozen to ensure atomic refcounting.
-        # FIXME(Immutable): Freezing a weakref currently makes it strong.
-        # self.assertTrue(is_frozen(wr))
+        self.assertTrue(is_frozen(wr))
         self.assertEqual(sys.getrefcount(wr), sys.getrefcount(baseline))
 
     def test_freeze_object_with_weakref_callback(self):

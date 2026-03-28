@@ -458,8 +458,8 @@ class TestWeakRef(unittest.TestCase):
         self.assertTrue(c.val() is obj)
         self.assertTrue(is_frozen(c.val()))
         obj = None
-        # The reference should remain as it was reachable through a frozen weakref.
-        self.assertTrue(c.val() is not None)
+        # The reference should be invalidated.
+        self.assertTrue(c.val() is None)
 
     # Thread safety of weakrefs is tested in test_freeze/test_weakref.py
 

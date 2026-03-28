@@ -475,8 +475,7 @@ immutable_make_weakref_safe(PyWeakReference *self)
 {
     if (self->wr_callback == NULL) {
         // Turn on atomic reference counting for the weakref.
-        // FIXME(Immutable): freezing a weakref makes it strong
-        // _PyImmutability_Freeze(_PyObject_CAST(newref));
+        _PyImmutability_Freeze(_PyObject_CAST(self));
     }
     else {
         // Pre-emptively increment the weakref's refcount.
