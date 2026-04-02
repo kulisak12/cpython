@@ -879,19 +879,17 @@ static void unfreeze(PyObject* obj)
     scc_return_to_gc(obj, true);
 }
 
-// Copy-pasted from weakrefobject.c
-static void weakref_handle_callback(PyWeakReference* ref, PyObject* callback)
-{
-    PyObject* cbresult = PyObject_CallOneArg(callback, (PyObject*)ref);
 
-    if (cbresult == NULL) {
-        PyErr_FormatUnraisable("Exception ignored while "
-                               "calling weakref callback %R", callback);
-    }
-    else {
-        Py_DECREF(cbresult);
-    }
+/* Clear the weakref. */
+static void weakref_clear(PyObject *op)
+{
+    PyWeakReference *self = _PyWeakref_CAST(op);
+    // We could also use LOCK_WEAKREFS here, but this is simpler.
+    LOCK_WEAKREFS_FOR_WR(self);
+    _PyWeakref_ClearRef(self);
+    UNLOCK_WEAKREFS_FOR_WR(self);
 }
+
 
 // Copy-pasted from weakrefobject.c
 static void weakref_insert_head(PyWeakReference* newref, PyWeakReference** list)
@@ -972,7 +970,7 @@ static int weakref_call_callbacks(void* arg)
         PyObject* callback = weakref->wr_callback;
         assert(callback != NULL);
         weakref->wr_callback = NULL;
-        weakref_handle_callback(weakref, callback);
+        _PyWeakref_HandleCallback(weakref, callback);
         Py_DECREF(callback);
         head = weakref->wr_next;
         weakref->wr_next = NULL;
@@ -1903,6 +1901,13 @@ int _Py_DecRef_Immutable(PyObject *op)
         // Callbacks were scheduled, deallocation will be triggered again.
         return false;
     }
+
+    // We need to clear the weakref before returning to GC and before making
+    // it mutable. Otherwise, code calling _Py_TryIncref_Immutable would fail.
+    if (PyWeakref_Check(op)) {
+        weakref_clear(op);
+    }
+
     if (PyObject_IS_GC(op)) {
         // This is a GC object, so we need to put it back on the GC list.
         debug("Returning to GC simple case %p\n", op);

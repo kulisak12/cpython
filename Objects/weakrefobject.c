@@ -72,18 +72,9 @@
  *
  * We also need to handle refcounts for the weakref object and the callback.
  *
- * - Basic weakrefs pointing to immutable objects are marked as immutable,
+ * - Weakrefs pointing to immutable objects are marked as immutable,
  *   which turns on atomic reference counting.
- * - Weakrefs with callbacks and pointing to immutable objects
- *   have their refcount pre-emptively incremented upon creation.
- *   That accounts for the TryIncref that would be called when clearing
- *   weakrefs, which would require atomic reference counting.
- *   However, we cannot easily achieve atomic reference counting for weakrefs
- *   with callbacks: we cannot make them immutable, and adding another branch
- *   to PY_INCREF and PY_DECREF would have a significant performance impact.
- *   The downside of our approach is that the weakref objects are kept alive
- *   until the immutable object dies.
- *   FIXME(Immutable): If the weakref is a part of an SCC, it never dies.
+ *   To avoid freezing callbacks, we wrap them in an interpreter local field.
  * - We keep the callback in the weakref object until it is about to be called.
  *   That keeps it alive, so we don't need to increment its refcount.
  *
@@ -473,17 +464,9 @@ insert_weakref(PyWeakReference *newref, PyWeakReference **list)
 static void
 immutable_make_weakref_safe(PyWeakReference *self)
 {
-    if (self->wr_callback == NULL) {
-        // Turn on atomic reference counting for the weakref.
-        // FIXME(Immutable): freezing a weakref makes it strong
-        // _PyImmutability_Freeze(_PyObject_CAST(newref));
-    }
-    else {
-        // Pre-emptively increment the weakref's refcount.
-        // See the comment at the start of this file for details.
-        Py_INCREF(self);
-    }
-
+    // Turn on atomic reference counting for the weakref.
+    // FIXME(Immutable): freezing a weakref makes it strong
+    // _PyImmutability_Freeze(_PyObject_CAST(newref));
 }
 
 /* Make weakrefs to the newly frozen object thread-safe. */
@@ -506,6 +489,56 @@ _PyWeakref_OnObjectFreeze(PyObject *object)
         current = current->wr_next;
     }
     UNLOCK_WEAKREFS(object);
+}
+
+static PyObject*
+get_iplocal_type(void)
+{
+    PyObject *module = PyImport_ImportModule("_immutable");
+    if (module == NULL) {
+        return NULL;
+    }
+
+    PyObject *type = PyObject_GetAttrString(module, "InterpreterLocal");
+    Py_DECREF(module);
+    if (type == NULL) {
+        return NULL;
+    }
+    return type;
+}
+
+/* Pre-freeze hook for the weakref.
+ * We don't want to freeze the callback,
+ * so we hide it behind an interpreter local field.
+ */
+static int
+weakref_prefreeze(PyObject *self)
+{
+    PyWeakReference *ref = _PyWeakref_CAST(self);
+    PyObject *callback = ref->wr_callback;
+    if (callback == NULL) {
+        return 0;
+    }
+
+    PyObject *iplocal_type = get_iplocal_type();
+    if (iplocal_type == NULL) {
+        return -1;
+    }
+    // Create a new InterpreterLocal and set the callback as its value.
+    PyObject *iplocal = PyObject_CallOneArg(iplocal_type, Py_None);
+    Py_DECREF(iplocal_type);
+    if (iplocal == NULL) {
+        return -1;
+    }
+    PyObject *result = PyObject_CallMethodOneArg(iplocal, &_Py_ID(set), callback);
+    if (result == NULL) {
+        Py_DECREF(iplocal);
+        return -1;
+    }
+    Py_DECREF(result);
+    Py_DECREF(callback);
+    ref->wr_callback = iplocal;
+    return 0;
 }
 
 static PyWeakReference *
@@ -632,6 +665,7 @@ _PyWeakref_RefType = {
     .tp_alloc = PyType_GenericAlloc,
     .tp_new = weakref___new__,
     .tp_free = PyObject_GC_Del,
+    .tp_prefreeze = weakref_prefreeze,
 };
 
 
@@ -997,6 +1031,7 @@ _PyWeakref_ProxyType = {
     proxy_iternext,                     /* tp_iternext */
     proxy_methods,                      /* tp_methods */
     .tp_reachable = _PyObject_ReachableVisitTypeAndTraverse,
+    .tp_prefreeze = weakref_prefreeze,
 };
 
 
@@ -1031,6 +1066,7 @@ _PyWeakref_CallableProxyType = {
     proxy_iter,                         /* tp_iter */
     proxy_iternext,                     /* tp_iternext */
     .tp_reachable = _PyObject_ReachableVisitTypeAndTraverse,
+    .tp_prefreeze = weakref_prefreeze,
 };
 
 PyObject *
@@ -1098,13 +1134,26 @@ PyWeakref_GetObject(PyObject *ref)
     return obj;  // borrowed reference
 }
 
-/* Note that there's an inlined copy-paste of handle_callback() in gcmodule.c's
- * handle_weakrefs().
- * There is also a copy-paste in immutability.c.
- */
-static void
-handle_callback(PyWeakReference *ref, PyObject *callback)
+static bool
+callback_is_iplocal(PyObject *callback)
 {
+    // Check without importing the immutable module.
+    const char *tp_name = Py_TYPE(callback)->tp_name;
+    if (tp_name == NULL) {
+        return false;
+    }
+    return strcmp(tp_name, "_immutable.InterpreterLocal") == 0;
+}
+
+/* Call the callback. */
+void
+_PyWeakref_HandleCallback(PyWeakReference *ref, PyObject *callback)
+{
+    // The real callback could be wrapped in InterpreterLocal.
+    if (callback_is_iplocal(callback)) {
+        callback = PyObject_CallMethod(callback, "get", NULL);
+    }
+
     PyObject *cbresult = PyObject_CallOneArg(callback, (PyObject *)ref);
 
     if (cbresult == NULL) {
@@ -1197,7 +1246,7 @@ PyObject_ClearWeakRefs(PyObject *object)
         PyObject *callback = PyTuple_GET_ITEM(tuple, i + 1);
         if (callback != NULL) {
             PyObject *weakref = PyTuple_GET_ITEM(tuple, i);
-            handle_callback((PyWeakReference *)weakref, callback);
+            _PyWeakref_HandleCallback((PyWeakReference *)weakref, callback);
         }
     }
 
@@ -1234,7 +1283,9 @@ _PyImmutability_ClearWeakRefsWithCallback(PyObject *object, PyWeakReference **ca
         next = next->wr_next;
         if (current->wr_callback != NULL) {
             clear_weakref_lock_held(current, NULL); // keeps the callback
-            insert_head(current, callbacks);
+            if (_Py_TryIncref_Immutable(_PyObject_CAST(current))) {
+                insert_head(current, callbacks);
+            }
         }
     }
     UNLOCK_WEAKREFS(object);

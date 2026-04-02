@@ -2023,6 +2023,7 @@ _PyStaticObjects_CheckRefcnt(PyInterpreterState *interp) {
     _PyStaticObject_CheckRefcnt((PyObject *)&_Py_ID(server_hostname));
     _PyStaticObject_CheckRefcnt((PyObject *)&_Py_ID(server_side));
     _PyStaticObject_CheckRefcnt((PyObject *)&_Py_ID(session));
+    _PyStaticObject_CheckRefcnt((PyObject *)&_Py_ID(set));
     _PyStaticObject_CheckRefcnt((PyObject *)&_Py_ID(setpgroup));
     _PyStaticObject_CheckRefcnt((PyObject *)&_Py_ID(setsid));
     _PyStaticObject_CheckRefcnt((PyObject *)&_Py_ID(setsigdef));

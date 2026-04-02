@@ -746,6 +746,7 @@ struct _Py_global_strings {
         STRUCT_FOR_ID(server_hostname)
         STRUCT_FOR_ID(server_side)
         STRUCT_FOR_ID(session)
+        STRUCT_FOR_ID(set)
         STRUCT_FOR_ID(setpgroup)
         STRUCT_FOR_ID(setsid)
         STRUCT_FOR_ID(setsigdef)

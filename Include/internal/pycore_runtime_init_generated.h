@@ -2021,6 +2021,7 @@ extern "C" {
     INIT_ID(server_hostname), \
     INIT_ID(server_side), \
     INIT_ID(session), \
+    INIT_ID(set), \
     INIT_ID(setpgroup), \
     INIT_ID(setsid), \
     INIT_ID(setsigdef), \
