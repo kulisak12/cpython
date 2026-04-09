@@ -461,36 +461,6 @@ insert_weakref(PyWeakReference *newref, PyWeakReference **list)
     }
 }
 
-static void
-immutable_make_weakref_safe(PyWeakReference *self)
-{
-    // Turn on atomic reference counting for the weakref.
-    // FIXME(Immutable): freezing a weakref makes it strong
-    // _PyImmutability_Freeze(_PyObject_CAST(newref));
-}
-
-/* Make weakrefs to the newly frozen object thread-safe. */
-void
-_PyWeakref_OnObjectFreeze(PyObject *object)
-{
-    assert(_Py_IsImmutable(object));
-    if (!_PyType_SUPPORTS_WEAKREFS(Py_TYPE(object))) {
-        return;
-    }
-    PyWeakReference **list = GET_WEAKREFS_LISTPTR(object);
-    if (_Py_atomic_load_ptr_acquire(list) == NULL) {
-        // Fast path for the common case
-        return;
-    }
-    LOCK_WEAKREFS(object);
-    PyWeakReference *current = *list;
-    while (current != NULL) {
-        immutable_make_weakref_safe(current);
-        current = current->wr_next;
-    }
-    UNLOCK_WEAKREFS(object);
-}
-
 static PyObject*
 get_iplocal_type(void)
 {
@@ -550,7 +520,8 @@ allocate_weakref(PyTypeObject *type, PyObject *obj, PyObject *callback)
     }
     init_weakref(newref, obj, callback);
     if (_Py_IsImmutable(obj)) {
-        immutable_make_weakref_safe(newref);
+        // Turn on atomic reference counting for the weakref.
+        _PyImmutability_Freeze(_PyObject_CAST(newref));
     }
     return newref;
 }

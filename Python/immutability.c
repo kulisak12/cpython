@@ -309,6 +309,9 @@ struct FreezeState {
     PyObject *dfs;
     // Used to track SCC to handle cycles during traversal
     PyObject *pending;
+    // Used to track weakref objects that should be frozen
+    // but should not count as an SCC edge.
+    PyObject *weakrefs;
 #endif
     // Used to track visited nodes that don't have inline GC state.
     // This is required to be able to backtrack a failed freeze.
@@ -446,6 +449,7 @@ static int init_freeze_state(struct FreezeState *state)
 #ifndef GIL_DISABLED
     state->dfs = PyList_New(0);
     state->pending = PyList_New(0);
+    state->weakrefs = PyList_New(0);
 #endif
     state->visited = _Py_hashtable_new(
         _Py_hashtable_hash_ptr,
@@ -480,9 +484,13 @@ static void deallocate_FreezeState(struct FreezeState *state)
     while(PyList_Size(state->dfs) > 0){
         pop(state->dfs);
     }
+    while(PyList_Size(state->weakrefs) > 0){
+        pop(state->weakrefs);
+    }
 
     Py_DECREF(state->dfs);
     Py_DECREF(state->pending);
+    Py_DECREF(state->weakrefs);
 #endif
 }
 
@@ -1991,41 +1999,6 @@ int _Py_IsDead_Immutable(PyObject *op)
 #endif
 }
 
-static void make_weakrefs_safe_scc(PyObject* scc)
-{
-    PyObject* current = scc;
-    do {
-        _PyWeakref_OnObjectFreeze(current);
-        current = scc_next(current);
-    } while (current != NULL && current != scc);
-}
-
-static int make_weakrefs_safe_visited(
-    _Py_hashtable_t* tbl, const void* key, const void* value, void* unused)
-{
-    (void)tbl;
-    (void)value;
-    (void)unused;
-    _PyWeakref_OnObjectFreeze((PyObject*)key);
-    return 0;
-}
-
-/* Make weakrefs to newly frozen objects thread-safe. */
-static void make_weakrefs_safe(struct FreezeState* freeze_state)
-{
-    // Handle weakrefs to completed SCCs.
-    PyObject *scc = freeze_state->completed_sccs;
-    while (scc != NULL) {
-        PyObject *next = scc_parent(scc);
-        make_weakrefs_safe_scc(scc);
-        scc = next;
-    }
-    // Handle weakrefs to non-GC visited objects.
-    _Py_hashtable_foreach(freeze_state->visited,
-                          make_weakrefs_safe_visited, NULL);
-
-}
-
 /* This undoes a freeze belonging to the given state */
 static void undo_freeze(struct FreezeState* state) {
     // Artifact[Implementation]: The function that rolls back immutability on failure
@@ -2044,6 +2017,11 @@ static void undo_freeze(struct FreezeState* state) {
             continue;
         }
         unfreeze(item);
+    }
+
+    // Clear the list of weakref objects that were supposed to be frozen
+    while(PyList_Size(state->weakrefs) > 0){
+        pop(state->weakrefs);
     }
 
     // Unfreeze completed SCCs via intrusive linked list.
@@ -2147,6 +2125,36 @@ static int check_pre_freeze_hook(struct _Py_immutability_state *imm_state, PyObj
     return _run_pre_freeze_hook(imm_state, obj);
 }
 
+#define GET_WEAKREFS_LISTPTR(o) \
+        ((PyWeakReference **) _PyObject_GET_WEAKREFS_LISTPTR(o))
+
+/* Ensure that weakrefs to the object will be frozen.
+ * Add them to freeze_state->weakrefs instead of freeze_state->dfs
+ * because we are following an imaginary edge,
+ * which should not count as an SCC edge.
+ */
+static int traverse_freeze_weakrefs(PyObject *obj, struct FreezeState* freeze_state)
+{
+    PyWeakReference **list = GET_WEAKREFS_LISTPTR(obj);
+    if (_Py_atomic_load_ptr_acquire(list) == NULL) {
+        // Fast path for the common case
+        return 0;
+    }
+    LOCK_WEAKREFS(obj);
+    PyWeakReference *current = *list;
+    while (current != NULL) {
+        SUCCEEDS(push(freeze_state->weakrefs, (PyObject*)current));
+        current = current->wr_next;
+    }
+    UNLOCK_WEAKREFS(obj);
+    return 0;
+
+error:
+    UNLOCK_WEAKREFS(obj);
+    return -1;
+}
+
+
 static int traverse_freeze(PyObject* obj, struct FreezeState* freeze_state)
 {
     //  WARNING
@@ -2165,6 +2173,12 @@ static int traverse_freeze(PyObject* obj, struct FreezeState* freeze_state)
     }
 
     SUCCEEDS(get_reachable_proc(Py_TYPE(obj))(obj, (visitproc)freeze_visit, freeze_state));
+
+    // Weakrefs to frozen objects should also be frozen
+    // to turn on atomic reference counting.
+    if (_PyType_SUPPORTS_WEAKREFS(Py_TYPE(obj))) {
+        traverse_freeze_weakrefs(obj, freeze_state);
+    }
 
     // Weak references are not followed by the GC, but should be
     // for immutability.  Otherwise, we could share mutable state
@@ -2244,6 +2258,20 @@ late_init(struct _Py_immutability_state *state)
         PyErr_Clear();
     }
 #endif
+}
+
+/* Pop an item from dfs.
+ * If dfs is empty, pop from weakrefs.
+ * Returns NULL if both are empty.
+ */
+static PyObject* pop_next_item(struct FreezeState* state) {
+    if (PyList_Size(state->dfs) != 0) {
+        return pop(state->dfs);
+    }
+    if (PyList_Size(state->weakrefs) != 0) {
+        return pop(state->weakrefs);
+    }
+    return NULL;
 }
 
 // Core freeze implementation that supports multiple root objects.
@@ -2335,6 +2363,7 @@ freeze_impl(PyObject *const *objs, Py_ssize_t nobjs)
 restart:
         assert(PyList_Size(freeze_state.dfs) == 0);
         assert(PyList_Size(freeze_state.pending) == 0);
+        assert(PyList_Size(freeze_state.weakrefs) == 0);
         for (Py_ssize_t i = 0; i < nobjs; i++) {
             if (_Py_IsImmutable(objs[i])) {
                 continue;
@@ -2344,9 +2373,8 @@ restart:
         freeze_state.restart = false;
     }
 
-    while (PyList_Size(freeze_state.dfs) != 0) {
-        PyObject* item = pop(freeze_state.dfs);
-
+    PyObject* item;
+    while ((item = pop_next_item(&freeze_state)) != NULL) {
         if (item == PostOrderMarker) {
             item = pop(freeze_state.dfs);
 
@@ -2436,7 +2464,6 @@ restart:
         SUCCEEDS(traverse_freeze(item, &freeze_state));
     }
 
-    make_weakrefs_safe(&freeze_state);
     mark_all_frozen(&freeze_state);
 
     goto finally;
