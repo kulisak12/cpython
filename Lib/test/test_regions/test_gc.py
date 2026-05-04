@@ -1,16 +1,45 @@
+import gc
+import test.support
 import unittest
 
 from regions import Cown, Region
-import gc
+
 
 class TestRegionGC(unittest.TestCase):
     class A:
         pass
 
+    class Resurrectable:
+        def __init__(self, data):
+            self.data = data
+
+        def __del__(self):
+            self.data["counter"] += 1
+            self.data["instance"] = self
+
+    class GcDetector:
+        def __init__(self, data):
+            self.data = data
+            self.loop = self
+
+        def __del__(self):
+            self.data["counter"] += 1
+
+    class CownReleaser:
+        def __init__(self, to_release):
+            self.to_release = to_release
+            self.loop = self
+
+        def __del__(self):
+            self.to_release.release()
+
     def setUp(self):
         # Need to run collection multiple times to clean up region chains
         while gc.collect() > 0:
             pass
+
+    def tearDown(self):
+        gc.disable()
 
     def build_cycle(self):
         a = self.A()
@@ -23,6 +52,13 @@ class TestRegionGC(unittest.TestCase):
         r.a = self.build_cycle()
         r.a = None
         return r
+
+    def build_detector_cown(self):
+        r = Region()
+        r.data = {"counter": 0}
+        r.detector = self.GcDetector(r.data)
+        r.detector = None
+        return Cown(r)
 
     def test_local_gc_ignores_regions(self):
         r = Region()
@@ -95,18 +131,10 @@ class TestRegionGC(unittest.TestCase):
         self.assertEqual(gc.collect(), 0)
 
     def test_finalizer(self):
-        class Resurrectable:
-            def __init__(self, data):
-                self.data = data
-
-            def __del__(self):
-                self.data["counter"] += 1
-                self.data["instance"] = self
-
         r = Region()
         r.data = {"counter": 0, "instance": None}
         r.a = self.build_cycle()
-        r.a.f = Resurrectable(r.data)
+        r.a.resurrectable = self.Resurrectable(r.data)
         r.a = None
 
         # The cycle should be collected
@@ -118,6 +146,18 @@ class TestRegionGC(unittest.TestCase):
         # The finalizer should not run again
         r.data["instance"] = None
         self.assertEqual(r.data["counter"], 1)
+
+    def test_release_fails(self):
+        r = Region()
+        cown = Cown(r)
+        r.releaser = self.CownReleaser(cown)
+        r.releaser = None
+        r = None
+
+        # Releasing a garbage collected cown should fail
+        with test.support.catch_unraisable_exception() as cm:
+            gc.collect_region(cown)
+            self.assertIs(cm.unraisable.exc_type, RuntimeError)
 
     # TODO(regions-gc): test that region GC is triggered, but not when disabled
     # TODO(regions-gc): GC callbacks

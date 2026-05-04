@@ -17,6 +17,8 @@
 #define NO_BLOCKING_TIMEOUT -1
 #define UNSET_THREAD_ID     ((_PyCown_ipid_t)0xff00000000000000LL)
 
+typedef struct _gc_runtime_state GCState;
+
 typedef enum CownLockStatus {
     COWN_ACQUIRE_ERROR = -1,
     COWN_ACQUIRE_FAIL = 0,
@@ -57,6 +59,9 @@ struct _PyCownObject {
      * Therefore, we are responsible for releasing and acquireing the GIL.
      */
     PyMutex lock;
+
+    /* Whether this cown is currently being collected by the region GC. */
+    int collecting;
 };
 
 static _PyCown_ipid_t cown_get_owner(_PyCownObject *obj) {
@@ -431,6 +436,13 @@ static int cown_release(_PyCownObject *self, _PyCown_ipid_t unlocking_ip) {
         return -1;
     }
 
+    if (self->collecting) {
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "the cown can't be released, since it is currently being garbage collected");
+        return -1;
+    }
+
     if (cown_is_value_cown_or_immutable(self)) {
         // Can be released without any restrictions
         return cown_release_unchecked(self, unlocking_ip);
@@ -451,11 +463,48 @@ static int cown_release(_PyCownObject *self, _PyCown_ipid_t unlocking_ip) {
     return cown_release_unchecked(self, unlocking_ip);
 }
 
+/* Release the cown after performing garbage collection. */
+static void cown_gc_release(_PyCownObject *self, _PyCown_ipid_t this_ip) {
+    if (cown_release(self, this_ip) == 0) {
+        return;
+    }
+    // Cannot release the cown, likely because the region has been opened.
+    // Nobody expects this cown to suddently be acquired.
+    // Replace the cown's value.
+    // FIXME(cowns): Replace with an exception once they can be frozen.
+    PyErr_FormatUnraisable("Exception ignored while garbage collecting a cown");
+    cown_set_value_unchecked(self, Py_None);
+    // Should be able to release now.
+    int res = cown_release(self, this_ip);
+    assert(res == 0);
+}
+
+/* Collect the region tree inside the cown,
+ * but only if we have budget to do so and the cown is released.
+ */
+static void cown_try_collect(_PyCownObject *self, _PyCown_ipid_t this_ip) {
+    PyThreadState *tstate = PyThreadState_Get();
+    GCState *gcstate = &tstate->interp->gc;
+    if (!gcstate->enabled || gcstate->region_budget <= 0) {
+        return;
+    }
+
+    // Lock without blocking, we only want the cown if it is released.
+    int res = cown_lock(self, NO_BLOCKING_TIMEOUT, this_ip, true);
+    if (res != COWN_ACQUIRE_SUCCESS) {
+        return;
+    }
+    // TODO(regions-gc): Run in a thread.
+    _PyGC_CollectRegion(tstate, _PyObject_CAST(self), _Py_GC_REASON_HEAP);
+    cown_gc_release(self, this_ip);
+}
+
 static PyObject* CownObject_release(_PyCownObject *self, PyObject *ignored) {
     _PyCown_ipid_t this_ip = _PyCown_ThisInterpreterId();
     if (cown_release(self, this_ip) < 0) {
         return NULL;
     }
+    cown_try_collect(self, this_ip);
 
     Py_RETURN_NONE;
 }
@@ -618,6 +667,10 @@ PyTypeObject _PyCown_Type = {
     PyType_GenericNew,                       /* tp_new */
     .tp_flags2 = Py_TPFLAGS2_REGION_AWARE
 };
+
+void _PyCown_SetCollecting(_PyCownObject *self, int value) {
+    self->collecting = value;
+}
 
 int _PyCown_SwitchFromGcToIp(_PyCownObject *self) {
     _PyCown_ipid_t ipid = _PyCown_ThisInterpreterId();

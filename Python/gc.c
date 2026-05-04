@@ -1649,6 +1649,16 @@ mark_at_start(PyThreadState *tstate)
     return objects_marked;
 }
 
+static Py_ssize_t
+calculate_heap_fraction(GCState *gcstate)
+{
+    int scale_factor = gcstate->old[0].threshold;
+    if (scale_factor < 2) {
+        scale_factor = 2;
+    }
+    return gcstate->heap_size / SCAN_RATE_DIVISOR / scale_factor;
+}
+
 static intptr_t
 assess_work_to_do(GCState *gcstate)
 {
@@ -1664,13 +1674,9 @@ assess_work_to_do(GCState *gcstate)
      * This could be improved by tracking survival rates, but it is still a
      * large improvement on the non-marking approach.
      */
-    intptr_t scale_factor = gcstate->old[0].threshold;
-    if (scale_factor < 2) {
-        scale_factor = 2;
-    }
     intptr_t new_objects = gcstate->young.count;
     intptr_t max_heap_fraction = new_objects*3/2;
-    intptr_t heap_fraction = gcstate->heap_size / SCAN_RATE_DIVISOR / scale_factor;
+    intptr_t heap_fraction = calculate_heap_fraction(gcstate);
     if (heap_fraction > max_heap_fraction) {
         heap_fraction = max_heap_fraction;
     }
@@ -1696,10 +1702,6 @@ gc_collect_increment(PyThreadState *tstate, struct gc_collection_stats *stats)
     PyGC_Head *visited = &gcstate->old[gcstate->visited_space].head;
     PyGC_Head increment;
     gc_list_init(&increment);
-    int scale_factor = gcstate->old[0].threshold;
-    if (scale_factor < 2) {
-        scale_factor = 2;
-    }
     intptr_t objects_marked = mark_stacks(tstate->interp, visited, gcstate->visited_space, false);
     GC_STAT_ADD(1, objects_transitively_reachable, objects_marked);
     gcstate->work_to_do -= objects_marked;
@@ -1726,7 +1728,7 @@ gc_collect_increment(PyThreadState *tstate, struct gc_collection_stats *stats)
     gc_collect_chunk(tstate, &increment, &survivors, stats);
     gc_list_merge(&survivors, visited);
     assert(gc_list_is_empty(&increment));
-    gcstate->work_to_do += gcstate->heap_size / SCAN_RATE_DIVISOR / scale_factor;
+    gcstate->work_to_do += calculate_heap_fraction(gcstate);
     gcstate->work_to_do -= increment_size;
 
     add_stats(gcstate, 1, stats);
@@ -1944,7 +1946,7 @@ gc_region_list_split(PyGC_Head *list, PyGC_Head *contained)
  * This function can run without the GIL if the region is closed.
  */
 static void
-region_extract_unreachable(Py_region_t region_id)
+region_extract_unreachable(Py_region_t region_id, Py_ssize_t *object_count)
 {
     _Py_region_data *data = _Py_region_data_CAST(region_id);
 
@@ -1966,6 +1968,9 @@ region_extract_unreachable(Py_region_t region_id)
     gc_list_merge(&contained, &data->gc_list);
     /* Save the unreachable objects. */
     gc_list_merge(&unreachable, &data->unreachable);
+
+    /* Estimate number of objects using the rc.*/
+    *object_count += data->rc;
 }
 
 static void
@@ -2056,7 +2061,8 @@ gc_collect_region_tree(PyThreadState *tstate,
     }
     region_list_build_dfs(root);
     for (_PyRegionObject *curr = root; curr != NULL; curr = curr->next) {
-        region_extract_unreachable(_PyRegion_Get(curr));
+        // Abusing stats.uncollectable to count objects in the region tree.
+        region_extract_unreachable(_PyRegion_Get(curr), &stats->uncollectable);
     }
     if (release_gil) {
         Py_BLOCK_THREADS
@@ -2427,15 +2433,42 @@ _PyGC_CollectRegion(PyThreadState *tstate, PyObject *region, _PyGC_Reason reason
 
     struct gc_collection_stats stats = { 0 };
     Py_region_t region_id = _PyRegion_Get(region);
+
+    if (cown != NULL) {
+        // Ensure the cown will not be released.
+        _PyCown_SetCollecting(cown, 1);
+    }
     PyObject *exc = _PyErr_GetRaisedException(tstate);
     gc_collect_region_tree(tstate, region_id, cown, &stats);
     _PyErr_SetRaisedException(tstate, exc);
+    if (cown != NULL) {
+        _PyCown_SetCollecting(cown, 0);
+    }
+    if (reason == _Py_GC_REASON_HEAP) {
+        // uncollectable is used to count the objects in the region tree.
+        gcstate->region_budget -= stats.uncollectable;
+    }
     return stats.collected;
 
 error:
     PyErr_SetString(PyExc_TypeError,
         "region parameter must be a bridge or an acquired cown storing a bridge");
     return -1;
+}
+
+void
+_PyGC_RunRegionGC(PyThreadState *tstate)
+{
+    /* Currently, this function doesn't run anything immediately.
+     * It only sets a budget for collections when a cown is released.
+     */
+    GCState *gcstate = &tstate->interp->gc;
+    Py_ssize_t max_heap_fraction = gcstate->young.threshold * 3;
+    Py_ssize_t heap_fraction = calculate_heap_fraction(gcstate);
+    if (heap_fraction > max_heap_fraction) {
+        heap_fraction = max_heap_fraction;
+    }
+    gcstate->region_budget = heap_fraction;
 }
 
 void
@@ -2614,6 +2647,7 @@ _Py_RunGC(PyThreadState *tstate)
 {
     if (tstate->interp->gc.enabled) {
         _PyGC_Collect(tstate, 1, _Py_GC_REASON_HEAP);
+        _PyGC_RunRegionGC(tstate);
     }
 }
 
