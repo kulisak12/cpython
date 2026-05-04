@@ -6,6 +6,7 @@
 #include "pycore_region.h"
 #include "pycore_regionobject.h"
 #include "pycore_time.h"          // _PyTime_FromSeconds()
+#include "pycore_gc.h"
 
 /* Macro that jumps to error, if the expression `x` does not succeed. */
 #define SUCCEEDS(x) { do { int r = (x); if (r != 0) goto error; } while (0); }
@@ -16,6 +17,9 @@
 #define GC_IPID             ((_PyCown_ipid_t)0xffff00ff00ff00ffLL)
 #define NO_BLOCKING_TIMEOUT -1
 #define UNSET_THREAD_ID     ((_PyCown_ipid_t)0xff00000000000000LL)
+
+#define AS_GC(cown) _Py_AS_GC(_PyObject_CAST(cown))
+#define FROM_GC(gc) _PyCownObject_CAST(_Py_FROM_GC(gc))
 
 typedef struct _gc_runtime_state GCState;
 
@@ -211,6 +215,56 @@ static int cown_lock(_PyCownObject* self, PyTime_t timeout, _PyCown_ipid_t locki
     return COWN_ACQUIRE_SUCCESS;
 }
 
+/*** GC list functions, simplified because cowns don't use flags. ***/
+
+static inline void
+gc_list_init(PyGC_Head *list)
+{
+    list->_gc_prev = (uintptr_t)list;
+    list->_gc_next = (uintptr_t)list;
+}
+
+static inline int
+gc_list_is_empty(PyGC_Head *list)
+{
+    return (list->_gc_next == (uintptr_t)list);
+}
+
+static inline void
+gc_list_append(PyGC_Head *node, PyGC_Head *list)
+{
+    PyGC_Head *last = (PyGC_Head *)list->_gc_prev;
+    // last <-> node
+    node->_gc_prev = (uintptr_t)last;
+    last->_gc_next = (uintptr_t)node;
+
+    // node <-> list
+    node->_gc_next = (uintptr_t)list;
+    list->_gc_prev = (uintptr_t)node;
+}
+
+static inline void
+gc_list_remove(PyGC_Head *node)
+{
+    PyGC_Head *prev = _PyGCHead_PREV(node);
+    PyGC_Head *next = _PyGCHead_NEXT(node);
+
+    prev->_gc_next = (uintptr_t)next;
+    next->_gc_prev = (uintptr_t)prev;
+
+    node->_gc_next = 0; /* object is not currently tracked */
+}
+
+static PyGC_Head visited;
+static PyGC_Head pending;
+/* One lock for both lists because we may not know which one the cown is in. */
+static PyMutex cown_list_lock;
+
+void _PyCown_InitState(void) {
+    gc_list_init(&visited);
+    gc_list_init(&pending);
+}
+
 /* Returns the interpreter id used by cowns.
  *
  * The caller must hold the GIL.
@@ -242,6 +296,9 @@ static int PyCown_init(_PyCownObject *self, PyObject *args, PyObject *kwds) {
     // This moves the region into the cown region
     // This will also remove the cown from the GC cycle
     SUCCEEDS(_PyRegion_SetCownRegion(self));
+    PyMutex_Lock(&cown_list_lock);
+    gc_list_append(AS_GC(self), &pending);
+    PyMutex_Unlock(&cown_list_lock);
 
     // See if we got a value as a keyword argument
     static char *kwlist[] = {"value", NULL};
@@ -286,8 +343,12 @@ static int PyCown_clear(_PyCownObject *self) {
 }
 
 static void PyCown_dealloc(_PyCownObject *self) {
-    // Self has already been removed from the GC when it was moved
-    // into the cown region.
+    // Self could be in the pending or visited list.
+    if (_PyObject_GC_IS_TRACKED(self)) {
+        PyMutex_Lock(&cown_list_lock);
+        gc_list_remove(AS_GC(self));
+        PyMutex_Unlock(&cown_list_lock);
+    }
     PyCown_clear(self);
     PyObject_GC_Del(self);
 }
@@ -497,6 +558,60 @@ static void cown_try_collect(_PyCownObject *self, _PyCown_ipid_t this_ip) {
     // TODO(regions-gc): Run in a thread.
     _PyGC_CollectRegion(tstate, _PyObject_CAST(self), _Py_GC_REASON_HEAP);
     cown_gc_release(self, this_ip);
+}
+
+/* Trigger garbage collection for this cown.
+ * The caller should have already acquired the cown
+ * and removed it from the pending list.
+ */
+static void cown_gc_acquired(_PyCownObject *self) {
+    PyThreadState *tstate = PyThreadState_Get();
+
+    _PyGC_CollectRegion(tstate, _PyObject_CAST(self), _Py_GC_REASON_HEAP);
+
+    PyMutex_Lock(&cown_list_lock);
+    gc_list_append(AS_GC(self), &visited);
+    PyMutex_Unlock(&cown_list_lock);
+}
+
+/* Try to acquire one of the pending cowns.
+ * Returns NULL if no released cowns were found.
+ */
+static _PyCownObject* pending_try_acquire(void) {
+    _PyCown_ipid_t this_ip = _PyCown_ThisInterpreterId();
+    PyMutex_Lock(&cown_list_lock);
+    PyGC_Head *current = _PyGCHead_NEXT(&pending);
+    while (current != &pending) {
+        _PyCownObject *cown = FROM_GC(current);
+        // Lock without blocking, we only want the cown if it is released.
+        int res = cown_lock(cown, NO_BLOCKING_TIMEOUT, this_ip, true);
+        if (res == COWN_ACQUIRE_SUCCESS) {
+            Py_INCREF(cown);
+            gc_list_remove(current);
+            PyMutex_Unlock(&cown_list_lock);
+            return cown;
+        }
+        current = _PyGCHead_NEXT(current);
+    }
+    PyMutex_Unlock(&cown_list_lock);
+    return NULL;
+}
+
+/* Pop the first cown from pending and return it.
+ * Returns NULL if pending is empty.
+ */
+static _PyCownObject* pending_pop(void) {
+    PyMutex_Lock(&cown_list_lock);
+    if (gc_list_is_empty(&pending)) {
+        PyMutex_Unlock(&cown_list_lock);
+        return NULL;
+    }
+    PyGC_Head *first = _PyGCHead_NEXT(&pending);
+    _PyCownObject *cown = FROM_GC(first);
+    Py_INCREF(cown);
+    gc_list_remove(first);
+    PyMutex_Unlock(&cown_list_lock);
+    return cown;
 }
 
 static PyObject* CownObject_release(_PyCownObject *self, PyObject *ignored) {

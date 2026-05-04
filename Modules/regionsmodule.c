@@ -164,6 +164,7 @@ regions_exec(PyObject *module) {
     }
 
     // Register the `Cown` type
+    _PyCown_InitState();
     if (PyType_Ready(&_PyCown_Type) < 0) {
         return -1;
     }
